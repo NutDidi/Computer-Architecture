@@ -1,0 +1,159 @@
+#include "cache.h"
+
+#define GHB_SIZE 256
+#define IT_SIZE 256
+#define PREFETCH_DEGREE 10
+#define PREFETCH_LOOKAHEAD 1
+
+struct GHB_entry
+{
+    //global miss address
+    uint64_t miss_addr = 0;
+    //link pointer
+    GHB_entry* prev = NULL;
+};
+
+struct IT_entry
+{
+    //pointer to GHB
+    GHB_entry* GHB_index = NULL;
+};
+
+GHB_entry GHB[GHB_SIZE];
+IT_entry IT[IT_SIZE]; 
+
+bool inCycle = false;
+int insert_index = 0;
+
+
+void CACHE::l2c_prefetcher_initialize() 
+{
+    cout << "CPU " << cpu << " L2C GHB(G/CS) prefetcher" << endl;
+    
+    for(int i = 0; i < IT_SIZE; i++)
+    {
+        IT[i].GHB_index = NULL;
+    }
+
+    for(int i = 0; i < GHB_SIZE; i++)
+    {
+        GHB[i].miss_addr = 0;
+        GHB[i].prev = NULL;
+    }
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    if(inCycle)
+    {
+        //Invalidate IT entries and GHB entries related to GHB[insert_index]
+        for(int i = 0; i < IT_SIZE; i++)
+        {
+            if(IT[i].GHB_index == &GHB[insert_index])
+                IT[i].GHB_index = NULL;
+        }
+        for(int i = 0; i < GHB_SIZE; i++)
+        {
+            if(GHB[i].prev == &GHB[insert_index])
+                GHB[i].prev = NULL;
+        } 
+    }
+
+
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    // this is a new cl_addr that doesn't have a GHBentry yet, so allocate one
+    int ITindex = ip % IT_SIZE ;
+    
+    //insert GHBentry
+    GHB[insert_index].miss_addr = cl_addr;
+    GHB[insert_index].prev = IT[ITindex].GHB_index;
+
+    //update index table
+    IT[ITindex].GHB_index =  &GHB[insert_index];
+
+    //store recent 3 miss address
+    GHB_entry* temp = &GHB[insert_index];
+
+    //update insert index
+    if(insert_index == GHB_SIZE-1 && inCycle == false) inCycle = true;  
+ 
+    if(temp == NULL) 
+    {
+        //update insert index
+        insert_index = (insert_index + 1) % GHB_SIZE; 
+        return metadata_in;
+    }
+    uint64_t last_addr1 = temp->miss_addr;
+
+    temp = temp->prev;
+    if(temp == NULL) 
+    {
+        //update insert index
+        insert_index = (insert_index + 1) % GHB_SIZE; 
+        return metadata_in;
+    }
+    uint64_t last_addr2 = temp->miss_addr;
+
+    temp = temp->prev;
+    if(temp == NULL) 
+    {
+        //update insert index
+        insert_index = (insert_index + 1) % GHB_SIZE; 
+        return metadata_in;
+    }
+    uint64_t last_addr3 = temp->miss_addr;
+   
+    int stride1 = (last_addr1>=last_addr2) ? (last_addr1-last_addr2) : (-1)*(last_addr2-last_addr1);
+    int stride2 = (last_addr2>=last_addr3) ? (last_addr2-last_addr3) : (-1)*(last_addr3-last_addr2);
+
+    // don't do anything if we somehow saw the same address twice in a row
+    if(stride1==0)
+    {
+        insert_index = (insert_index + 1) % GHB_SIZE; 
+        return metadata_in;
+    }
+    if(stride2==0)
+    {
+        //update insert index
+        insert_index = (insert_index + 1) % GHB_SIZE; 
+        return metadata_in;
+    }    
+
+    // only do any prefetching if there's a pattern of seeing the consecutive same stride
+    if(stride1 == stride2) 
+    {
+        // do some prefetching
+        for (int i=0; i<PREFETCH_DEGREE; i++) 
+        {
+            uint64_t pf_address = (cl_addr + (stride1*(i+PREFETCH_LOOKAHEAD))) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page 
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+	            prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            else
+	            prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+        }
+    }
+
+    //update insert index
+    insert_index = (insert_index + 1) % GHB_SIZE; 
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C GHB(G/CS) prefetcher final stats" << endl;
+}
+
